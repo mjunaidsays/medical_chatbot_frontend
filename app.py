@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import time
 
-BACKEND_URL = "http://localhost:8000/api/v1"
+BACKEND_URL = "https://ef664999acaa.ngrok-free.app/api/v1"
 
 st.set_page_config(page_title="Medical Chatbot 2.0", page_icon="💬", layout="wide")
 

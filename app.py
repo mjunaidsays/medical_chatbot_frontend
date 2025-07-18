@@ -3,7 +3,9 @@ import requests
 import pandas as pd
 import time
 import io
+import base64
 from audio_recorder_streamlit import audio_recorder
+import uuid
 
 BACKEND_URL = "http://localhost:8000/api/v1"
 
@@ -448,6 +450,26 @@ def reset_all():
             del st.session_state[key]
     st.session_state.page = "bot_select"
 
+def text_to_speech(text):
+    """
+    Convert text to speech using ElevenLabs API via backend
+    """
+    try:
+        response = requests.post(
+            f"{BACKEND_URL}/text-to-speech",
+            json={"text": text}
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success") and data.get("audio_base64"):
+                # Decode base64 audio
+                audio_data = base64.b64decode(data["audio_base64"])
+                return audio_data
+        return None
+    except Exception as e:
+        st.error(f"TTS Error: {str(e)}")
+        return None
+
 def start_session(bot_type, user_name):
     if bot_type == "exam":
         resp = requests.post(f"{BACKEND_URL}/exam/start_session", json={"user_name": user_name})
@@ -733,7 +755,7 @@ def chat_page():
         st.warning("No question received from backend. Please try selecting the topic again.")
     # Display chat history
     pending_typing = False
-    for msg in st.session_state.chat_history:
+    for i, msg in enumerate(st.session_state.chat_history):
         if msg["role"] == "user":
             with st.chat_message("user", avatar=None):
                 st.markdown(f'<div class="chat-user">{msg["content"]}</div>', unsafe_allow_html=True)
@@ -741,7 +763,33 @@ def chat_page():
             pending_typing = True
         else:
             with st.chat_message("assistant", avatar=None):
+                # Display the message content
                 st.markdown(f'<div class="chat-assistant">{msg["content"]}</div>', unsafe_allow_html=True)
+                
+                # Add speaker button for bot messages (only for non-pending messages)
+                if msg["role"] == "assistant" and msg["content"] != "__PENDING__":
+                    # Create a unique key for each message's speaker button
+                    speaker_key = f"speaker_btn_{i}"
+                    
+                    # Add speaker button with icon
+                    col1, col2 = st.columns([1, 20])
+                    with col1:
+                        if st.button("🔊", key=speaker_key, help="Listen to this message"):
+                            # Generate audio for this message
+                            audio_data = text_to_speech(msg["content"])
+                            if audio_data:
+                                b64 = base64.b64encode(audio_data).decode()
+                                unique_id = uuid.uuid4()
+                                audio_html = f'''
+                                    <audio autoplay style="display:none;" id="audio_{unique_id}">
+                                        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3" />
+                                    </audio>
+                                '''
+                                st.markdown(audio_html, unsafe_allow_html=True)
+                            else:
+                                st.error("Failed to generate audio")
+                    with col2:
+                        st.write("")  # Empty space for alignment
     # Show typing animation if pending
     if pending_typing:
         with st.chat_message("assistant", avatar=None):
@@ -761,15 +809,29 @@ def chat_page():
     </style>
     """, unsafe_allow_html=True)
     # --- Chat input row with audio recorder and send button ---
+    # --- At the start of chat_page(), ensure the flag is initialized ---
+    if "clear_input_box" not in st.session_state:
+        st.session_state.clear_input_box = False
+
+    # --- Before the text input widget ---
+    if st.session_state.get("clear_input_box", False):
+        st.session_state.voice_transcribed_text = ""
+        st.session_state.custom_input_value = ""
+        input_value = ""
+        st.session_state.clear_input_box = False  # reset flag
+    else:
+        input_value = st.session_state.voice_transcribed_text if st.session_state.voice_transcribed_text else st.session_state.get("custom_input_value", "")
+
     col1, col2, col3 = st.columns([10, 1, 1], gap="small")
     with col1:
         user_input = st.text_input(
             label="Message",  # Non-empty label for accessibility
-            value=st.session_state.voice_transcribed_text,
+            value=input_value,
             key="chat_input_box",
             placeholder="Type a message...",
             label_visibility="collapsed"  # Hide label visually
         )
+        st.session_state.custom_input_value = user_input
     with col2:
         audio_bytes = audio_recorder(
             text="",
@@ -807,8 +869,11 @@ def chat_page():
             del st.session_state["audio_recorder_btn"]
         st.rerun()
     # Only send when Send button is clicked and input is not empty
+    # --- When sending a message ---
     if send_clicked and user_input and user_input.strip():
         st.session_state.voice_transcribed_text = ""  # clear after use
+        st.session_state.custom_input_value = ""      # clear manual input as well
+        st.session_state.clear_input_box = True       # set flag to clear input
         if st.session_state.selected_bot == "exam":
             submit_exam_answer(user_input)
             st.rerun()
@@ -908,6 +973,34 @@ def chat_page():
         }
         </style>
     """, unsafe_allow_html=True)
+    
+    # Add CSS for speaker button styling
+    st.markdown("""
+    <style>
+    /* Speaker button styling */
+    .speaker-btn {
+        background: #f0f0f0 !important;
+        color: #333 !important;
+        border: 1px solid #ddd !important;
+        border-radius: 50% !important;
+        width: 40px !important;
+        height: 40px !important;
+        font-size: 16px !important;
+        padding: 0 !important;
+        margin: 5px 0 !important;
+        transition: all 0.2s ease !important;
+    }
+    .speaker-btn:hover {
+        background: #e0e0e0 !important;
+        transform: scale(1.1) !important;
+    }
+    /* Audio player styling */
+    .stAudio {
+        margin-top: 10px !important;
+        margin-bottom: 10px !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     # --- End Speech to Text Integration ---
 
 # Evaluation summary page
@@ -917,11 +1010,25 @@ def evaluation_page():
     if not summary:
         st.error("No evaluation summary available.")
         return
-    st.title("📊 Exam Evaluation Summary")
+    st.title("\U0001F4CA Exam Evaluation Summary")
     st.markdown(f"**Total Questions:** {summary['total_questions']}")
     st.markdown(f"**Correct Answers:** {summary['correct_count']}")
     st.markdown(f"**Wrong Answers:** {summary['wrong_count']}")
-    st.markdown(f"**Overall Result:** <span style='font-size:1.2rem; font-weight:bold;'>{summary['overall_result']}</span>", unsafe_allow_html=True)
+    percent = 0
+    if summary['total_questions'] > 0:
+        percent = (summary['correct_count'] / summary['total_questions']) * 100
+    # Determine result category
+    if percent <= 50:
+        result = "Fail"
+    elif 60 <= percent <= 69:
+        result = "Pass"
+    elif 70 <= percent <= 79:
+        result = "Good Pass"
+    elif percent >= 80:
+        result = "Excellent"
+    else:
+        result = "Fail"
+    st.markdown(f"**Overall Result:** <span style='font-size:1.2rem; font-weight:bold;'>{result}</span>", unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("### Details:")
     for idx, detail in enumerate(summary['details']):

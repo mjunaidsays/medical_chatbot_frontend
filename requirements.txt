@@ -5,3 +5,4 @@ pandas>=2.0.0
 audio-recorder-streamlit 
 streamlit-extras
 streamlit-chat-widget
+elevenlabs

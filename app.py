@@ -409,6 +409,21 @@ st.markdown('''
 </style>
 ''', unsafe_allow_html=True)
 
+# Add custom CSS for Send button min-width
+st.markdown('''
+<style>
+.send-btn-fixed {
+    min-width: 80px !important;
+    max-width: 100px !important;
+    width: 100% !important;
+    font-size: 1.1rem !important;
+    font-weight: bold !important;
+    padding: 0.7rem 0 !important;
+    border-radius: 12px !important;
+}
+</style>
+''', unsafe_allow_html=True)
+
 # Session state initialization
 if "page" not in st.session_state:
     st.session_state.page = "bot_select"
@@ -523,9 +538,7 @@ def submit_exam_answer(answer):
     # Track retries for the current question
     if "retry_count" not in st.session_state:
         st.session_state.retry_count = 0
-    # Immediately show user answer and pending bot message
-    st.session_state.chat_history.append({"role": "user", "content": answer})
-    st.session_state.chat_history.append({"role": "assistant", "content": "__PENDING__"})
+    # DON'T add to chat history here - it's already done in on_send()
     st.session_state.pending_exam_answer = answer
     st.session_state.pending_exam_processing = False  # Set to False so next rerun just shows spinner
     # Do NOT call st.rerun() here, just return to let UI update
@@ -539,6 +552,26 @@ def ask_patient_question(question):
         st.session_state.chat_history.append({"role": "assistant", "content": data["answer"]})
         return True
     else:
+        st.error("Failed to get answer.")
+        return False
+
+def ask_patient_question_direct(question):
+    """Direct API call without adding to chat history (already added in on_send)"""
+    resp = requests.post(f"{BACKEND_URL}/patient/ask_question", json={"session_token": st.session_state.session_token, "question": question})
+    if resp.status_code == 200:
+        data = resp.json()
+        # Find and replace the most recent __PENDING__ message
+        for i in range(len(st.session_state.chat_history)-1, -1, -1):
+            if st.session_state.chat_history[i]["role"] == "assistant" and st.session_state.chat_history[i]["content"] == "__PENDING__":
+                st.session_state.chat_history[i]["content"] = data["answer"]
+                break
+        return True
+    else:
+        # Replace __PENDING__ with error message
+        for i in range(len(st.session_state.chat_history)-1, -1, -1):
+            if st.session_state.chat_history[i]["role"] == "assistant" and st.session_state.chat_history[i]["content"] == "__PENDING__":
+                st.session_state.chat_history[i]["content"] = "[Error: Failed to get answer]"
+                break
         st.error("Failed to get answer.")
         return False
 
@@ -636,7 +669,7 @@ with st.sidebar:
 def bot_select_page():
     st.markdown("""
     <div style="display: flex; flex-direction: column; align-items: center; margin-top: 2rem;">
-        <h1 style="font-size: 2.5rem; color: #000; margin-bottom: 0.5rem;">Welcome to Medical Chatbot 2.0</h1>
+        <h1 style="font-size: 2.5rem; color: #000; margin-bottom: 0.5rem;">Welcome to Medical Chatbot</h1>
         <p style="font-size: 1.2rem; color: #000; margin-bottom: 2rem;">Choose your assistant to get started:</p>
     </div>
     """, unsafe_allow_html=True)
@@ -736,17 +769,26 @@ def chat_page():
     # --- Ensure all session state variables are initialized at the very start ---
     if "input_key" not in st.session_state:
         st.session_state.input_key = 0
-    # Ensure voice_transcribed_text is initialized
+    # --- At the start of chat_page(), ensure the flag is initialized ---
+    if "input_key" not in st.session_state:
+        st.session_state.input_key = 0
+    if "chat_input_value" not in st.session_state:
+        st.session_state.chat_input_value = ""
     if "voice_transcribed_text" not in st.session_state:
         st.session_state.voice_transcribed_text = ""
     if "last_audio_bytes" not in st.session_state:
         st.session_state.last_audio_bytes = None
-    if "custom_input_value" not in st.session_state:
-        st.session_state.custom_input_value = ""
+    if "pending_exam_submitted" not in st.session_state:
+        st.session_state.pending_exam_submitted = False
     # Ensure chat_history is always a list
     if "chat_history" not in st.session_state or not isinstance(st.session_state.chat_history, list):
         st.session_state.chat_history = []
-    st.title(f"💬 {st.session_state.selected_bot.title()} Chat - {st.session_state.selected_topic}")
+    # --- Topic and Audio Toggle at the very top ---
+    col_topic, col_toggle = st.columns([8, 1])
+    with col_topic:
+        st.title(f"💬 {st.session_state.selected_bot.title()} Chat - {st.session_state.selected_topic}")
+    with col_toggle:
+        audio_enabled = st.toggle("Audio", value=False, key="audio_toggle")
     st.markdown(f"**User:** {st.session_state.user_name}")
     st.markdown(f"**Session:** {st.session_state.session_token[:8]}...")
     st.markdown("---")
@@ -763,19 +805,13 @@ def chat_page():
             pending_typing = True
         else:
             with st.chat_message("assistant", avatar=None):
-                # Display the message content
                 st.markdown(f'<div class="chat-assistant">{msg["content"]}</div>', unsafe_allow_html=True)
-                
-                # Add speaker button for bot messages (only for non-pending messages)
-                if msg["role"] == "assistant" and msg["content"] != "__PENDING__":
-                    # Create a unique key for each message's speaker button
+                # Only show speaker button if audio is enabled
+                if msg["role"] == "assistant" and msg["content"] != "__PENDING__" and st.session_state.get("audio_toggle", False):
                     speaker_key = f"speaker_btn_{i}"
-                    
-                    # Add speaker button with icon
                     col1, col2 = st.columns([1, 20])
                     with col1:
                         if st.button("🔊", key=speaker_key, help="Listen to this message"):
-                            # Generate audio for this message
                             audio_data = text_to_speech(msg["content"])
                             if audio_data:
                                 b64 = base64.b64encode(audio_data).decode()
@@ -808,40 +844,70 @@ def chat_page():
     }
     </style>
     """, unsafe_allow_html=True)
-    # --- Chat input row with audio recorder and send button ---
-    # --- At the start of chat_page(), ensure the flag is initialized ---
-    if "clear_input_box" not in st.session_state:
-        st.session_state.clear_input_box = False
+    # --- Chat input row with audio recorder and send button overlay ---
+    def on_send():
+        # Get current input key and read from the correct widget
+        current_input_key = f"chat_input_box_{st.session_state.input_key}"
+        user_input = st.session_state.get(current_input_key, "")
+        
+        if user_input and user_input.strip():
+            # Display the user's message immediately
+            st.session_state.chat_history.append({"role": "user", "content": user_input})
+            # Show loading dots in place of bot response
+            st.session_state.chat_history.append({"role": "assistant", "content": "__PENDING__"})
+            
+            # Clear voice input after use
+            st.session_state.voice_transcribed_text = ""
+            
+            if st.session_state.selected_bot == "exam":
+                # For exam bot, set pending answer for processing
+                st.session_state.pending_exam_answer = user_input
+                st.session_state.pending_exam_processing = False
+                st.session_state.pending_exam_submitted = False  # Reset flag to trigger backend call on next rerun
+            else:
+                # For patient bot, trigger direct API call
+                ask_patient_question_direct(user_input)
+            
+            # Increment the input key to force widget recreation and clearing
+            st.session_state.input_key += 1
+            # Reset the chat input value for next input
+            st.session_state.chat_input_value = ""
+            # Do NOT call st.rerun() here; Streamlit reruns automatically after callback
 
-    # --- Before the text input widget ---
-    if st.session_state.get("clear_input_box", False):
-        st.session_state.voice_transcribed_text = ""
-        st.session_state.custom_input_value = ""
-        input_value = ""
-        st.session_state.clear_input_box = False  # reset flag
-    else:
-        input_value = st.session_state.voice_transcribed_text if st.session_state.voice_transcribed_text else st.session_state.get("custom_input_value", "")
-
-    col1, col2, col3 = st.columns([10, 1, 1], gap="small")
+    # Update chat_input_value based on voice input
+    if st.session_state.voice_transcribed_text:
+        st.session_state.chat_input_value = st.session_state.voice_transcribed_text
+    
+    # Create dynamic input key for clearing
+    input_key = f"chat_input_box_{st.session_state.input_key}"
+    
+    col1, col2, col3 = st.columns([10, 1.5, 1.5], gap="small")
     with col1:
-        user_input = st.text_input(
+        st.text_input(
             label="Message",  # Non-empty label for accessibility
-            value=input_value,
-            key="chat_input_box",
+            value=st.session_state.chat_input_value,
+            key=input_key,
             placeholder="Type a message...",
-            label_visibility="collapsed"  # Hide label visually
+            label_visibility="collapsed"  # Hide label visually, removed on_change to fix double submission
         )
-        st.session_state.custom_input_value = user_input
     with col2:
-        audio_bytes = audio_recorder(
-            text="",
-            icon_size="2x",
-            pause_threshold=2.0,
-            sample_rate=16000,
-            key="audio_recorder_btn"
-        )
+        audio_bytes = None
+        if st.session_state.get("audio_toggle", False):
+            audio_bytes = audio_recorder(
+                text="",
+                icon_size="2x",
+                pause_threshold=2.0,
+                sample_rate=16000,
+                key="audio_recorder_btn"
+            )
     with col3:
-        send_clicked = st.button("Send", key="send_btn", use_container_width=True)
+        # Only trigger on_send if the input is not empty and not just whitespace
+        if st.button("Send", key="send_btn", use_container_width=True):
+            user_input = st.session_state.get(input_key, "")
+            if user_input and user_input.strip():
+                on_send()
+        # Apply fixed style to the button
+        st.markdown('<style>div[data-testid="column"] button[kind="primary"] {min-width:80px !important; max-width:100px !important; width:100% !important;}</style>', unsafe_allow_html=True)
     # --- Show warning if last transcription failed ---
     if st.session_state.get("show_transcription_warning"):
         st.warning("No transcript returned by backend.")
@@ -857,6 +923,7 @@ def chat_page():
                 if transcript and transcript.strip():
                     st.session_state.voice_transcribed_text = transcript
                     st.session_state.show_transcription_warning = False
+                    st.session_state.chat_input_value = transcript  # This is before the widget is created on next rerun
                 else:
                     st.session_state.show_transcription_warning = True
             else:
@@ -868,67 +935,72 @@ def chat_page():
         if "audio_recorder_btn" in st.session_state:
             del st.session_state["audio_recorder_btn"]
         st.rerun()
-    # Only send when Send button is clicked and input is not empty
-    # --- When sending a message ---
-    if send_clicked and user_input and user_input.strip():
-        st.session_state.voice_transcribed_text = ""  # clear after use
-        st.session_state.custom_input_value = ""      # clear manual input as well
-        st.session_state.clear_input_box = True       # set flag to clear input
-        if st.session_state.selected_bot == "exam":
-            submit_exam_answer(user_input)
-            st.rerun()
-        else:
-            ask_patient_question(user_input)
-            st.rerun()
-
-    # --- Exam bot backend processing ---
+    # --- Exam bot backend processing (separate rerun approach) ---
     if st.session_state.selected_bot == "exam":
-        # Find the most recent pending assistant message
-        for i in range(len(st.session_state.chat_history)-1, -1, -1):
-            msg = st.session_state.chat_history[i]
-            if msg["role"] == "assistant" and msg["content"] == "__PENDING__":
-                answer = st.session_state.pending_exam_answer
-                resp = requests.post(f"{BACKEND_URL}/exam/submit_answer", json={
-                    "session_token": st.session_state.session_token,
-                    "answer": answer
-                })
-                if resp.status_code == 200:
-                    data = resp.json()
-                    with st.expander("DEBUG: Backend response for exam/submit_answer"):
-                        st.json(data)
-                    print("DEBUG: Backend response for exam/submit_answer:", data)
-                    # Remove the pending message
-                    del st.session_state.chat_history[i]
-                    # Update question index and total questions if present
-                    if "question_index" in data:
-                        st.session_state.question_index = data["question_index"]
-                    if "total_questions" in data:
-                        st.session_state.total_questions = data["total_questions"]
-                    # Insert evaluation and next question if present
-                    eval_text = (
-                        data.get("evaluation") or
-                        data.get("result") or
-                        data.get("feedback") or
-                        None
-                    )
-                    if eval_text:
-                        st.session_state.chat_history.append({"role": "assistant", "content": eval_text})
+        # Check if we have a pending answer that hasn't been processed yet
+        if st.session_state.get("pending_exam_answer") and not st.session_state.get("pending_exam_submitted", False):
+            # Set a flag to trigger backend processing in next rerun
+            st.session_state.pending_exam_submitted = True
+            # Immediately rerun to show the UI update first
+            st.rerun()
+        
+        # In a separate rerun, do the actual backend processing
+        if st.session_state.get("pending_exam_answer") and st.session_state.get("pending_exam_submitted", False) and not st.session_state.get("backend_processing_done", False):
+            # Mark processing as started to prevent duplicate calls
+            st.session_state.backend_processing_done = True
+            
+            answer = st.session_state.pending_exam_answer
+            resp = requests.post(f"{BACKEND_URL}/exam/submit_answer", json={
+                "session_token": st.session_state.session_token,
+                "answer": answer
+            })
+            
+            # Find and replace the __PENDING__ message
+            for i in range(len(st.session_state.chat_history)-1, -1, -1):
+                msg = st.session_state.chat_history[i]
+                if msg["role"] == "assistant" and msg["content"] == "__PENDING__":
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        with st.expander("DEBUG: Backend response for exam/submit_answer"):
+                            st.json(data)
+                        print("DEBUG: Backend response for exam/submit_answer:", data)
+                        # Remove the pending message
+                        del st.session_state.chat_history[i]
+                        # Update question index and total questions if present
+                        if "question_index" in data:
+                            st.session_state.question_index = data["question_index"]
+                        if "total_questions" in data:
+                            st.session_state.total_questions = data["total_questions"]
+                        # Insert evaluation and next question if present
+                        eval_text = (
+                            data.get("evaluation") or
+                            data.get("result") or
+                            data.get("feedback") or
+                            None
+                        )
+                        if eval_text:
+                            st.session_state.chat_history.append({"role": "assistant", "content": eval_text})
+                        else:
+                            st.session_state.chat_history.append({"role": "assistant", "content": f"[No evaluation key found. Full response: {data}]"})
+                        if data.get("next_question"):
+                            st.session_state.chat_history.append({"role": "assistant", "content": data["next_question"]})
+                        # If finished, just set exam_finished flag
+                        if data.get("finished"):
+                            st.session_state.exam_finished = True
+                            # Do NOT call end_session or rerun here!
                     else:
-                        st.session_state.chat_history.append({"role": "assistant", "content": f"[No evaluation key found. Full response: {data}]"})
-                    if data.get("next_question"):
-                        st.session_state.chat_history.append({"role": "assistant", "content": data["next_question"]})
-                    # If finished, just set exam_finished flag
-                    if data.get("finished"):
-                        st.session_state.exam_finished = True
-                        # Do NOT call end_session or rerun here!
-                else:
-                    del st.session_state.chat_history[i]
-                    st.session_state.chat_history.append({"role": "assistant", "content": "[Error: Failed to get evaluation]"})
-                st.session_state.pending_exam_answer = None
-                st.session_state.pending_exam_processing = False
-                st.rerun()
-                break
-    # After processing all questions and receiving exam_finished/evaluation_summary
+                        del st.session_state.chat_history[i]
+                        # Only show error if backend actually returns an error
+                        st.session_state.chat_history.append({"role": "assistant", "content": "[Error: Failed to get evaluation]"})
+                    break
+            
+            # Clean up pending state
+            st.session_state.pending_exam_answer = None
+            st.session_state.pending_exam_processing = False
+            st.session_state.pending_exam_submitted = False
+            st.session_state.backend_processing_done = False
+            st.rerun()
+# After processing all questions and receiving exam_finished/evaluation_summary
     if st.session_state.selected_bot == "exam" and st.session_state.get("exam_finished") and not st.session_state.get("evaluation_summary"):
         st.success("You have completed all questions!")
         if st.button("Show Evaluation Summary", key="show_eval_summary_btn", use_container_width=True):
@@ -1031,11 +1103,52 @@ def evaluation_page():
     st.markdown(f"**Overall Result:** <span style='font-size:1.2rem; font-weight:bold;'>{result}</span>", unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("### Details:")
+    # Build HTML for download
+    html_summary = f"""
+    <h1>Exam Evaluation Summary</h1>
+    <p><b>Total Questions:</b> {summary['total_questions']}</p>
+    <p><b>Correct Answers:</b> {summary['correct_count']}</p>
+    <p><b>Wrong Answers:</b> {summary['wrong_count']}</p>
+    <p><b>Overall Result:</b> <span style='font-size:1.2rem; font-weight:bold;'>{result}</span></p>
+    <hr/>
+    <h2>Details:</h2>
+    """
     for idx, detail in enumerate(summary['details']):
         st.markdown(f"**Q{idx+1}:** {detail['question']}")
         st.markdown(f"- Your Answer: {detail['your_answer']}")
+        st.markdown(f"- Actual Answer: {detail.get('actual_answer', '[Not available]')}")
         st.markdown(f"- Result: <span style='color:{'green' if detail['result']=='Correct' else 'red'};'>{detail['result']}</span>", unsafe_allow_html=True)
+        st.markdown(f"- Feedback: {detail.get('feedback', '[No feedback]')}")
         st.markdown("---")
+        html_summary += f"""
+        <div style='margin-bottom:16px;'>
+        <b>Q{idx+1}:</b> {detail['question']}<br/>
+        <b>Your Answer:</b> {detail['your_answer']}<br/>
+        <b>Actual Answer:</b> {detail.get('actual_answer', '[Not available]')}<br/>
+        <b>Result:</b> <span style='color:{'green' if detail['result']=='Correct' else 'red'};'>{detail['result']}</span><br/>
+        <b>Feedback:</b> {detail.get('feedback', '[No feedback]')}<br/>
+        </div>
+        <hr/>
+        """
+    # Advanced: Download summary as PDF
+    import requests as req
+    from io import BytesIO
+    # Show the download button directly, styled like Start New Session
+    if st.button("Download Summary as PDF", use_container_width=True, key="download_pdf_btn", type="primary"):
+        # Call backend to get PDF
+        resp = req.post(f"{BACKEND_URL}/exam/evaluation_pdf", json={"session_token": st.session_state.session_token})
+        if resp.status_code == 200:
+            pdf_bytes = resp.content
+            st.download_button(
+                label="Click here to download PDF",
+                data=pdf_bytes,
+                file_name="evaluation_summary.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="pdf_download_btn_real"
+            )
+        else:
+            st.error("Failed to generate PDF. Please try again.")
     if st.button("Start New Session", use_container_width=True):
         reset_all()
         st.rerun()
